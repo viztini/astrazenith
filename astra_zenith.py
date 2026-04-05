@@ -61,6 +61,7 @@ except ImportError:
     readline = None  # Windows compatibility
 import atexit
 import argparse
+import re
 import textwrap
 from pathlib import Path
 from datetime import datetime
@@ -80,6 +81,88 @@ except ImportError:
     console = None
 
 VERSION = "1.0.0"
+
+# Fixed width for REPL frames (matches welcome banner top line).
+REPL_BOX_WIDTH = len("╭─ AstraZenith ───────────────────────────────────╮")
+
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _visible_len(s: str) -> int:
+    return len(_ANSI_ESCAPE_RE.sub("", s))
+
+
+def _repl_box_top_welcome() -> str:
+    inner = REPL_BOX_WIDTH - 2
+    core = "─ AstraZenith "
+    return "╭" + core + "─" * (inner - len(core)) + "╮"
+
+
+def _print_repl_banner_row(*segments: str) -> None:
+    """Pad inner row so ``│`` closes on the right (segments may include ANSI)."""
+    inner = REPL_BOX_WIDTH - 4
+    body = "".join(segments)
+    pad = max(0, inner - _visible_len(body))
+    print(clr("│", "dim") + body + (" " * pad) + clr(" │", "dim"))
+
+
+def _repl_box_top_astra() -> str:
+    inner = REPL_BOX_WIDTH - 2
+    core = "─ Astra ● "
+    return "╭" + core + "─" * (inner - len(core)) + "╮"
+
+
+def _repl_box_bottom() -> str:
+    return "╰" + "─" * (REPL_BOX_WIDTH - 2) + "╯"
+
+
+def _print_repl_box_top_astra() -> None:
+    line = _repl_box_top_astra()
+    print()
+    if "●" in line:
+        a, _, b = line.partition("●")
+        print(clr(a, "dim") + clr("●", "green") + clr(b, "dim"))
+    else:
+        print(clr(line, "dim"))
+
+
+def _print_repl_box_body_lines(text: str, *body_style: str) -> None:
+    """Print wrapped lines as │ … │ so the frame closes on the right."""
+    inner = REPL_BOX_WIDTH - 4
+    lines: list[str] = []
+    for para in text.splitlines():
+        if not para.strip():
+            lines.append("")
+        else:
+            lines.extend(
+                textwrap.wrap(
+                    para,
+                    width=inner,
+                    break_long_words=True,
+                    break_on_hyphens=False,
+                )
+            )
+    for ln in lines:
+        if len(ln) > inner:
+            ln = ln[: inner - 1] + "…"
+        pad = inner - len(ln)
+        print(
+            clr("│ ", "dim")
+            + (clr(ln, *body_style) if body_style else ln)
+            + (" " * pad)
+            + clr(" │", "dim"),
+        )
+
+
+def _repair_empty_open_pipe_row() -> None:
+    """Replace a lone left ``│ `` row (no right border) with a full-width blank boxed row."""
+    inner = REPL_BOX_WIDTH - 4
+    sys.stdout.write("\033[1A\033[2K\r")
+    print(
+        clr("│ ", "dim") + (" " * inner) + clr(" │", "dim"),
+        flush=True,
+    )
+
 
 # ── ANSI helpers (used even with rich for non-markdown output) ─────────────
 C = {
@@ -147,7 +230,11 @@ def flush_response():
             print()   # newline after streaming
             console.print(Markdown(full))
             return
-    print()  # ensure newline after stream
+    if full.strip():
+        print()  # newline after streamed assistant text
+    else:
+        # Started ``│ `` but printed no chunks — close the row so the frame matches body lines
+        _repair_empty_open_pipe_row()
 
 def print_tool_start(name: str, inputs: dict, verbose: bool):
     """Show tool invocation."""
@@ -1036,6 +1123,7 @@ def repl(config: dict, initial_prompt: str = None):
     from config import HISTORY_FILE
     from context import build_system_prompt
     from agent import AgentState, run, TextChunk, ThinkingChunk, ToolStart, ToolEnd, TurnDone, PermissionRequest
+    from providers import ProviderError
 
     setup_readline(HISTORY_FILE)
     state = AgentState()
@@ -1049,66 +1137,88 @@ def repl(config: dict, initial_prompt: str = None):
         model_clr = clr(model, "cyan", "bold")
         prov_clr  = clr(f"({pname})", "dim")
         pmode     = clr(config.get("permission_mode", "auto"), "yellow")
-        print(clr("╭─ AstraZenith ───────────────────────────────────╮", "dim"))
-        print(clr("│  Model: ", "dim") + model_clr + " " + prov_clr)
-        print(clr("│  Permissions: ", "dim") + pmode)
-        print(clr("│  /model to switch provider · /help for commands │", "dim"))
-        print(clr("╰──────────────────────────────────────────────────╯", "dim"))
+        print(clr(_repl_box_top_welcome(), "dim"))
+        _print_repl_banner_row(
+            clr("  Model: ", "dim"),
+            model_clr,
+            clr(" ", "dim"),
+            prov_clr,
+        )
+        _print_repl_banner_row(
+            clr("  Permissions: ", "dim"),
+            pmode,
+        )
+        _print_repl_banner_row(
+            clr("  /model to switch provider · /help for commands", "dim"),
+        )
+        print(clr(_repl_box_bottom(), "dim"))
         print()
 
-    def run_query(user_input: str):
+    def run_query(user_input: str) -> bool:
+        """Run one user turn. Returns False if the provider failed (already printed)."""
         nonlocal verbose
         verbose = config.get("verbose", False)
 
         # Rebuild system prompt each turn (picks up cwd changes, etc.)
         system_prompt = build_system_prompt()
 
-        print(clr("\n╭─ Astra ", "dim") + clr("●", "green") + clr(" ─────────────────────────", "dim"))
+        _print_repl_box_top_astra()
         print(clr("│ ", "dim"), end="", flush=True)
 
         thinking_started = False
 
-        for event in run(user_input, state, config, system_prompt):
-            if isinstance(event, TextChunk):
-                stream_text(event.text)
+        try:
+            for event in run(user_input, state, config, system_prompt):
+                if isinstance(event, TextChunk):
+                    stream_text(event.text)
 
-            elif isinstance(event, ThinkingChunk):
-                if verbose:
-                    if not thinking_started:
-                        print(clr("\n  [thinking]", "dim"))
-                        thinking_started = True
-                    stream_thinking(event.text, verbose)
+                elif isinstance(event, ThinkingChunk):
+                    if verbose:
+                        if not thinking_started:
+                            print(clr("\n  [thinking]", "dim"))
+                            thinking_started = True
+                        stream_thinking(event.text, verbose)
 
-            elif isinstance(event, ToolStart):
-                flush_response()
-                print_tool_start(event.name, event.inputs, verbose)
+                elif isinstance(event, ToolStart):
+                    flush_response()
+                    print_tool_start(event.name, event.inputs, verbose)
 
-            elif isinstance(event, PermissionRequest):
-                event.granted = ask_permission_interactive(event.description, config)
+                elif isinstance(event, PermissionRequest):
+                    event.granted = ask_permission_interactive(event.description, config)
 
-            elif isinstance(event, ToolEnd):
-                print_tool_end(event.name, event.result, verbose)
-                # Print prefix for next text
-                print(clr("│ ", "dim"), end="", flush=True)
+                elif isinstance(event, ToolEnd):
+                    print_tool_end(event.name, event.result, verbose)
+                    # Print prefix for next text
+                    print(clr("│ ", "dim"), end="", flush=True)
 
-            elif isinstance(event, TurnDone):
-                if verbose:
-                    print(clr(
-                        f"\n  [tokens: +{event.input_tokens} in / "
-                        f"+{event.output_tokens} out]", "dim"
-                    ))
+                elif isinstance(event, TurnDone):
+                    if verbose:
+                        print(clr(
+                            f"\n  [tokens: +{event.input_tokens} in / "
+                            f"+{event.output_tokens} out]", "dim"
+                        ))
+        except ProviderError as e:
+            flush_response()
+            _print_repl_box_body_lines(str(e), "red")
+            print(clr(_repl_box_bottom(), "dim"))
+            print()
+            from tools import drain_pending_questions
+            drain_pending_questions()
+            return False
 
         flush_response()
-        print(clr("╰──────────────────────────────────────────────", "dim"))
+        print(clr(_repl_box_bottom(), "dim"))
         print()
         # Drain any AskUserQuestion prompts raised during this turn
         from tools import drain_pending_questions
         drain_pending_questions()
+        return True
 
     # ── Main loop ──
     if initial_prompt:
         try:
-            run_query(initial_prompt)
+            if not run_query(initial_prompt):
+                sys.exit(1)
         except KeyboardInterrupt:
             print()
         return

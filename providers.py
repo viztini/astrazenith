@@ -21,7 +21,7 @@ Model string formats:
 """
 from __future__ import annotations
 import json
-from typing import Generator
+from typing import Generator, Optional, Tuple
 
 # ── Provider registry ──────────────────────────────────────────────────────
 
@@ -146,6 +146,20 @@ COSTS = {
     "glm-4-plus":               (0.7,   0.7),
 }
 
+# Alternate "provider/model" prefixes → keys in PROVIDERS (hyphens, typos, etc.)
+_PROVIDER_PREFIX_ALIASES: dict[str, str] = {
+    "lm-studio": "lmstudio",
+    "lm_studio": "lmstudio",
+    "llm-studio": "lmstudio",
+    "llm_studio": "lmstudio",
+}
+
+
+def _canonical_provider_prefix(prefix: str) -> str:
+    k = prefix.strip().lower().replace("_", "-")
+    return _PROVIDER_PREFIX_ALIASES.get(k, k)
+
+
 # Auto-detection: prefix → provider name
 _PREFIXES = [
     ("claude-",       "anthropic"),
@@ -170,7 +184,7 @@ def detect_provider(model: str) -> str:
     """Return provider name for a model string.
     Supports 'provider/model' explicit format, or auto-detect by prefix."""
     if "/" in model:
-        return model.split("/", 1)[0]
+        return _canonical_provider_prefix(model.split("/", 1)[0])
     for prefix, pname in _PREFIXES:
         if model.lower().startswith(prefix):
             return pname
@@ -200,6 +214,138 @@ def get_api_key(provider_name: str, config: dict) -> str:
 def calc_cost(model: str, in_tok: int, out_tok: int) -> float:
     ic, oc = COSTS.get(bare_model(model), (0.0, 0.0))
     return (in_tok * ic + out_tok * oc) / 1_000_000
+
+
+class ProviderError(RuntimeError):
+    """LLM provider request failed; message is safe to print in the REPL (no traceback)."""
+
+
+def _extract_http_error_details(exc: BaseException) -> Tuple[Optional[int], str]:
+    """Best-effort (status_code, message) from OpenAI SDK / httpx-style errors."""
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        response = getattr(exc, "response", None)
+        if response is not None:
+            status = getattr(response, "status_code", None)
+    msg = getattr(exc, "message", None)
+    if msg is None or not str(msg).strip():
+        msg = str(exc)
+    body = getattr(exc, "body", None)
+    if body is None:
+        response = getattr(exc, "response", None)
+        if response is not None:
+            try:
+                body = response.json()
+            except Exception:
+                pass
+    if isinstance(body, dict):
+        err = body.get("error")
+        if isinstance(err, dict) and err.get("message"):
+            msg = str(err["message"])
+        elif isinstance(err, str):
+            msg = err
+    return status, str(msg).strip()
+
+
+def _is_openai_connection_error(exc: BaseException) -> bool:
+    try:
+        from openai import APIConnectionError, APITimeoutError
+
+        return isinstance(exc, (APIConnectionError, APITimeoutError))
+    except ImportError:
+        name = type(exc).__name__
+        return "Connection" in name or "Timeout" in name
+
+
+def explain_openai_compat_error(
+    exc: BaseException,
+    *,
+    provider_name: str,
+    model: str,
+    base_url: str,
+) -> str:
+    """Turn a low-level SDK error into a short, actionable message."""
+    status, detail = _extract_http_error_details(exc)
+
+    if _is_openai_connection_error(exc):
+        if provider_name == "ollama":
+            return (
+                f"Could not connect to Ollama at {base_url}.\n\n"
+                "• Start the Ollama app (or `ollama serve`) and try again.\n"
+                "• Default API URL is http://localhost:11434/v1\n\n"
+                f"({type(exc).__name__}: {detail})"
+            )
+        if provider_name == "lmstudio":
+            return (
+                f"Could not connect to LM Studio at {base_url}.\n\n"
+                "• Open LM Studio, start the local server, and confirm the port.\n\n"
+                f"({type(exc).__name__}: {detail})"
+            )
+        if provider_name == "custom":
+            return (
+                f"Could not reach your OpenAI-compatible server at {base_url}.\n\n"
+                f"({type(exc).__name__}: {detail})"
+            )
+        return (
+            f"Could not reach '{provider_name}' at {base_url}.\n\n"
+            f"({type(exc).__name__}: {detail})"
+        )
+
+    if status == 401:
+        env_hint = PROVIDERS.get(provider_name, {}).get("api_key_env") or "API key env for this provider"
+        return (
+            f"Authentication failed for provider '{provider_name}' (HTTP 401).\n\n"
+            f"• Set the right API key (often via {env_hint}) or /config {provider_name}_api_key=...\n"
+            f"• URL: {base_url}\n\n"
+            f"Details: {detail}"
+        )
+
+    if status == 429:
+        return (
+            f"Rate limited by '{provider_name}' (HTTP 429).\n\n"
+            f"Details: {detail}"
+        )
+
+    if status == 404:
+        if provider_name == "ollama":
+            return (
+                f"Ollama has no model named '{model}' (HTTP 404).\n\n"
+                "Fix:\n"
+                "  • List installed models:  ollama list\n"
+                f"  • Pull a model:           ollama pull <name-from-library>  "
+                f"(e.g. ollama pull qwen2.5-coder)\n"
+                "  • Use the exact name in AstraZenith, e.g. --model ollama/qwen2.5-coder\n\n"
+                f"API: {base_url}\n"
+                f"Message: {detail}"
+            )
+        if provider_name == "lmstudio":
+            return (
+                f"LM Studio returned HTTP 404 for model '{model}'.\n\n"
+                "• Load a model in LM Studio, then use its id: --model lmstudio/<id>\n\n"
+                f"API: {base_url}\n"
+                f"Message: {detail}"
+            )
+        return (
+            f"Model or endpoint not found (HTTP 404) for provider '{provider_name}'.\n\n"
+            f"Model: {model}\n"
+            f"URL: {base_url}\n"
+            f"Message: {detail}"
+        )
+
+    if status is not None:
+        return (
+            f"Provider '{provider_name}' returned HTTP {status}.\n\n"
+            f"Model: {model}\n"
+            f"URL: {base_url}\n"
+            f"Message: {detail}"
+        )
+
+    return (
+        f"Unexpected error talking to '{provider_name}'.\n\n"
+        f"Model: {model}\n"
+        f"URL: {base_url}\n"
+        f"{type(exc).__name__}: {detail}"
+    )
 
 
 # ── Tool schema conversion ─────────────────────────────────────────────────
@@ -394,6 +540,7 @@ def stream_openai_compat(
     messages: list,
     tool_schemas: list,
     config: dict,
+    provider_name: str = "openai",
 ) -> Generator:
     """Stream from any OpenAI-compatible API. Yields TextChunk, then AssistantTurn."""
     from openai import OpenAI
@@ -418,43 +565,60 @@ def stream_openai_compat(
     tool_buf: dict = {}   # index → {id, name, args_str}
     in_tok = out_tok = 0
 
-    stream = client.chat.completions.create(**kwargs)
-    for chunk in stream:
-        if not chunk.choices:
-            # usage-only chunk (some providers send this last)
+    try:
+        stream = client.chat.completions.create(**kwargs)
+    except Exception as e:
+        raise ProviderError(
+            explain_openai_compat_error(
+                e, provider_name=provider_name, model=model, base_url=base_url
+            )
+        ) from None
+
+    try:
+        for chunk in stream:
+            if not chunk.choices:
+                # usage-only chunk (some providers send this last)
+                if hasattr(chunk, "usage") and chunk.usage:
+                    in_tok  = chunk.usage.prompt_tokens
+                    out_tok = chunk.usage.completion_tokens
+                continue
+
+            choice = chunk.choices[0]
+            delta  = choice.delta
+
+            if delta.content:
+                text += delta.content
+                yield TextChunk(delta.content)
+
+            if delta.tool_calls:
+                for tc in delta.tool_calls:
+                    idx = tc.index
+                    if idx not in tool_buf:
+                        tool_buf[idx] = {"id": "", "name": "", "args": "", "extra_content": None}
+                    if tc.id:
+                        tool_buf[idx]["id"] = tc.id
+                    if tc.function:
+                        if tc.function.name:
+                            tool_buf[idx]["name"] += tc.function.name
+                        if tc.function.arguments:
+                            tool_buf[idx]["args"] += tc.function.arguments
+                    # Capture extra_content (e.g. Gemini thought_signature)
+                    extra = getattr(tc, "extra_content", None)
+                    if extra:
+                        tool_buf[idx]["extra_content"] = extra
+
+            # Some providers include usage in the last chunk
             if hasattr(chunk, "usage") and chunk.usage:
-                in_tok  = chunk.usage.prompt_tokens
-                out_tok = chunk.usage.completion_tokens
-            continue
-
-        choice = chunk.choices[0]
-        delta  = choice.delta
-
-        if delta.content:
-            text += delta.content
-            yield TextChunk(delta.content)
-
-        if delta.tool_calls:
-            for tc in delta.tool_calls:
-                idx = tc.index
-                if idx not in tool_buf:
-                    tool_buf[idx] = {"id": "", "name": "", "args": "", "extra_content": None}
-                if tc.id:
-                    tool_buf[idx]["id"] = tc.id
-                if tc.function:
-                    if tc.function.name:
-                        tool_buf[idx]["name"] += tc.function.name
-                    if tc.function.arguments:
-                        tool_buf[idx]["args"] += tc.function.arguments
-                # Capture extra_content (e.g. Gemini thought_signature)
-                extra = getattr(tc, "extra_content", None)
-                if extra:
-                    tool_buf[idx]["extra_content"] = extra
-
-        # Some providers include usage in the last chunk
-        if hasattr(chunk, "usage") and chunk.usage:
-            in_tok  = chunk.usage.prompt_tokens  or in_tok
-            out_tok = chunk.usage.completion_tokens or out_tok
+                in_tok  = chunk.usage.prompt_tokens  or in_tok
+                out_tok = chunk.usage.completion_tokens or out_tok
+    except ProviderError:
+        raise
+    except Exception as e:
+        raise ProviderError(
+            explain_openai_compat_error(
+                e, provider_name=provider_name, model=model, base_url=base_url
+            )
+        ) from None
 
     tool_calls = []
     for idx in sorted(tool_buf):
@@ -503,5 +667,12 @@ def stream(
         else:
             base_url = prov.get("base_url", "https://api.openai.com/v1")
         yield from stream_openai_compat(
-            api_key, base_url, model_name, system, messages, tool_schemas, config
+            api_key,
+            base_url,
+            model_name,
+            system,
+            messages,
+            tool_schemas,
+            config,
+            provider_name=provider_name,
         )
