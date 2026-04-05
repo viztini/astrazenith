@@ -2,7 +2,7 @@
 
 AstraZenith is a **Python coding agent** with an interactive REPL, tool use (read/write files, shell, search, notebooks, diagnostics, and more), and support for **many model providers**—Anthropic (e.g. `claude-*` models), OpenAI, Gemini, Kimi, Qwen, Zhipu, DeepSeek, Ollama, LM Studio, and any OpenAI-compatible HTTP API.
 
-W## Why AstraZenith?
+## Why AstraZenith?
 
 Claude Code is a powerful, production-grade AI coding assistant — but its source code is a compiled, 12 MB TypeScript/Node.js bundle (~1,300 files, ~283K lines). It is tightly coupled to the Anthropic API, hard to modify, and impossible to run against a local or alternative model.
 
