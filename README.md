@@ -1,4 +1,4 @@
-# AstraZenith
+# AstraZenith [ALPHA]
 
 AstraZenith is a **Python coding agent** with an interactive REPL, tool use (read/write files, shell, search, notebooks, diagnostics, and more), and support for **many model providers**—Anthropic (e.g. `claude-*` models), OpenAI, Gemini, Kimi, Qwen, Zhipu, DeepSeek, Ollama, LM Studio, and any OpenAI-compatible HTTP API.
 
